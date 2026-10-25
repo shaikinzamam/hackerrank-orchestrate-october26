@@ -1,0 +1,7 @@
+﻿root_cause,count,classification
+subject identity / provenance gap,105,genuine evidence gap
+SECURITY_AUDIT_LOG retention condition missing,78,genuine evidence gap
+evidence inventory completeness,62,genuine evidence gap
+system/resource target parsing bug,40,genuine evidence gap
+BACKUP_ARCHIVE restore blockability missing,15,genuine evidence gap
+SUPPORT_MESSAGE shared-context condition missing,7,genuine evidence gap

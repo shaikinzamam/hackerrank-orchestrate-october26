@@ -62,6 +62,122 @@ Only `deletion_requests.csv` requires answers. The other files provide evidence 
 
 ---
 
+## Step 4: Identity and As-of Timeline Modules
+
+`code/identity_timeline.py` provides independent identity resolution and case
+timeline reconstruction. It consumes the current identity rows, audit rows, and
+the existing normalized `EvidenceFact` objects; it does not apply deletion
+policy, determine deletion status, or generate remediation steps.
+
+```python
+from evidence_ingestion import ingest_evidence
+from identity_timeline import (
+    load_activity_events,
+    load_identity_resolver,
+    reconstruct_timeline,
+)
+
+evidence = ingest_evidence(dataset / "evidence_files.csv")
+resolver = load_identity_resolver(
+    dataset / "user_identities.csv",
+    dataset / "user_audit_log.csv",
+    evidence_facts=evidence.facts,
+)
+activity = load_activity_events(dataset / "system_activity.csv")
+timeline = reconstruct_timeline(
+    request_row,
+    resolver,
+    activity_events=activity,
+)
+```
+
+Email matching trims surrounding whitespace and ignores case without changing
+provider-specific spelling; phone matching removes whitespace but preserves
+punctuation; email hashes are case-insensitive, and stable IDs are exact after
+trimming surrounding whitespace.
+Audit and evidence provenance is retained on identity links and timeline events.
+Identifiers with more than one possible stable owner remain ambiguous unless a
+temporal query disambiguates them. Each timeline event carries an
+`identity_status` so ambiguous activity or evidence is not silently merged.
+
+The supplied CSV timestamp columns use ISO-8601 UTC `Z` values. Offset-aware
+timestamps are compared as instants; naive timestamps are interpreted as UTC.
+Evidence capture time, source event time, and ingestion time are separate
+fields. Known future evidence, audit changes, and process activity are excluded
+at the request's `audit_at`; records with missing relevant timestamps remain
+explicitly marked `unknown_time` and cannot establish a historical absence.
+The supplied schemas do not provide ingestion timestamps, so those remain
+unset. Current identity values use their row's `updated_at` as the observation
+time, which cannot establish their exact start time; incomplete audit history
+may therefore leave earlier identity state unresolved.
+
+## Step 5: Lineage and Resurrection-Path Analysis
+
+`code/lineage_graph.py` represents directed, provenance-bearing flow evidence
+and analyzes paths independently of deletion-policy or final-status decisions.
+Its main interfaces are `build_lineage_graph`, `resource_evidence_from_facts`,
+`analyze_resurrection_paths`, and `simulate_edge_removals`. The graph builder
+uses the request's as-of timeline to retain only relevant activity events and
+filters evidence captured or observed after the cutoff. Activity time,
+evidence capture time, and ingestion time are not conflated; the supplied
+schemas do not provide an ingestion timestamp.
+
+The supplied activity schema provides `activity_id`, `event_time`, `event_type`,
+`source_system`, `target_system`, `resource_id`, `reported_result`, and
+`details`. Transfer-like activity rows are retained as observed operations,
+not persistent active flows: `reported_result` is an asserted outcome and
+cannot by itself prove that a process remains enabled. The evidence manifest
+provides `file_id`, `file_path`, `origin`, and `captured_at`. Inspected
+`DATA_FLOW` evidence provides `resource_id`, `destination`, `subject_selector`,
+`enabled`, and `mode`, but does not provide a source system. These incomplete
+configurations are kept as unresolved edges; a source is never inferred from a
+connector name or from unrelated activity. A matching `DISABLE_DATA_FLOW`
+event is retained as a timeline observation and makes an otherwise active
+configuration ambiguous; it does not itself prove that the disable succeeded.
+
+Only an explicitly directed, active, user-applicable flow with source-resource
+evidence can produce a confirmed path. A configuration observed earlier than
+the cutoff without a validity interval is treated as a possible, not confirmed,
+active path. Multi-hop traversal also requires evidence that the subject's
+relevant data is present at each intermediate source. `ResourceEvidence` leaves
+`contains_prohibited_data` unset unless a caller supplies a separately
+established policy-stage judgment; graph analysis does not decide what data is
+prohibited, whether deletion is complete, or what remediation to perform.
+Hypothetical edge-removal simulation only compares graph analyses and does not
+apply a change or verify deletion.
+
+Known limitation: the supplied connector configuration examples lack a source
+endpoint, while activity rows are point-in-time process claims rather than
+authoritative ongoing-flow state. Consequently, the supplied evidence may
+support unresolved or possible candidates but cannot, by itself, confirm a
+user-specific active recreation path where those links are missing.
+
+## Step 6: Policy Evaluation and Remediation Planning
+
+`code/policy_engine.py` loads every action and condition from
+`dataset/deletion_rules.csv`, evaluates identity-scoped evidence at each
+request's `audit_at`, and returns `COMPLETE`, `INCOMPLETE`, or
+`NOT_APPLICABLE`. It treats reported workflow states as claims, requires
+inventory completeness and lineage analysis before declaring completion, and
+keeps ambiguous identity, missing evidence, and uncertain flow candidates
+unresolved rather than turning them into confirmed findings.
+
+`code/remediation_planner.py` produces deterministic seven-field audit steps.
+It emits only supported evidence-backed findings, sorts each phase by the
+contract operation order and resource identifiers, and uses empty evidence
+references for proposed remediation and future verification. A retained
+backup is verified both as present and as unavailable to restore when restore
+access is blocked.
+
+Conditional policy rules do not define an alternative action when their
+condition is false. The policy engine therefore leaves those cases unresolved
+instead of inventing retention or deletion behavior. A required retained
+record that is missing also cannot be safely reconstructed using the allowed
+step operations, so planning reports that limitation rather than suggesting
+unsupported remediation.
+
+---
+
 ## Output
 
 Create `output.csv` with these columns in this exact order:
@@ -155,3 +271,46 @@ Before submitting, confirm that:
 - `code.zip` includes your runnable code, `README.md`, `code/evaluation/evaluation_report.md`, and `code/evaluation/usage_report.md`;
 - `log.txt` follows the `AGENTS.md` turn format and is uploaded to the `chat_transcript` slot; and
 - no API keys, credentials, real personal data, or sensitive configuration values are included.
+
+## Step 7: End-to-End Pipeline
+
+`code/main.py` connects manifest-backed evidence ingestion, historical identity
+resolution, as-of timeline reconstruction, lineage analysis, the 15 supplied
+policy rules, remediation planning, and output contract validation. Requests
+are processed in sorted `case_id` order. Structured JSON progress messages are
+written to stderr; they include counts and case IDs, not request emails or
+request text.
+
+Run the full pipeline from the repository root after you intend to create the
+submission output:
+
+```powershell
+python code/main.py
+```
+
+On success, the pipeline atomically writes the validated result to the
+repository-root `output.csv`. To exercise the public sample without changing
+either dataset output file:
+
+```powershell
+python code/main.py --requests dataset/sample_deletion_requests.csv --expected-cases 32 --output "$env:TEMP\ghost-sample-output.csv"
+```
+
+Use `--dataset`, `--requests`, `--expected-cases`, and `--output` to select
+other fixtures or destinations. The pipeline refuses to overwrite
+`dataset/output.csv` and `dataset/sample_output.csv`.
+
+Evidence files are parsed locally; the pipeline makes no network or paid API
+calls. PDF extraction requires `pdfplumber` or `PyPDF2`, and image validation
+requires Pillow. OCR is optional. If OCR is unavailable or any manifest item
+cannot be parsed, the evidence inventory is marked incomplete. Such cases
+cannot be marked `COMPLETE` based on the remaining files. Per-file and
+per-case failures are logged explicitly; valid rows are contract-checked, but
+the output destination is left untouched if any case cannot be represented
+safely.
+
+Explicit `data_store` evidence is used as the system target when a record has
+no more specific system field. Known inventory collection labels are mapped
+to matching supplied policy categories; unrecognized labels and connector
+configurations without explicit flow fields remain unresolved rather than
+being guessed.
